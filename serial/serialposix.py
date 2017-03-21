@@ -317,8 +317,9 @@ class Serial(SerialBase, PlatformSpecific):
 
         vmin = vtime = 0                # timeout is done via select
         if self._inter_byte_timeout is not None:
-            vmin = 1
+            vmin = 255
             vtime = int(self._inter_byte_timeout * 10)
+            fcntl.fcntl(self.fd, fcntl.F_SETFL, 0)  # clear O_NONBLOCK
         try:
             orig_attr = termios.tcgetattr(self.fd)
             iflag, oflag, cflag, lflag, ispeed, ospeed, cc = orig_attr
@@ -477,43 +478,54 @@ class Serial(SerialBase, PlatformSpecific):
         if not self.is_open:
             raise portNotOpenError
         read = bytearray()
-        timeout = Timeout(self._timeout)
-        while len(read) < size:
+        if self._inter_byte_timeout is not None and self._inter_byte_timeout > 0:
             try:
-                ready, _, _ = select.select([self.fd, self.pipe_abort_read_r], [], [], timeout.time_left())
-                if self.pipe_abort_read_r in ready:
-                    os.read(self.pipe_abort_read_r, 1000)
-                    break
-                # If select was used with a timeout, and the timeout occurs, it
-                # returns with empty lists -> thus abort read operation.
-                # For timeout == 0 (non-blocking operation) also abort when
-                # there is nothing to read.
-                if not ready:
-                    break   # timeout
-                buf = os.read(self.fd, size - len(read))
-                # read should always return some data as select reported it was
-                # ready to read when we get to this point.
-                if not buf:
-                    # Disconnected devices, at least on Linux, show the
-                    # behavior that they are always ready to read immediately
-                    # but reading returns nothing.
-                    raise SerialException(
-                        'device reports readiness to read but returned no data '
-                        '(device disconnected or multiple access on port?)')
+                buf = os.read(self.fd, size)
                 read.extend(buf)
             except OSError as e:
-                # this is for Python 3.x where select.error is a subclass of
-                # OSError ignore EAGAIN errors. all other errors are shown
+                # Ignore EAGAIN errors, all other errors are shown.
                 if e.errno != errno.EAGAIN and e.errno != errno.EINTR:
                     raise SerialException('read failed: {}'.format(e))
-            except select.error as e:
-                # this is for Python 2.x
-                # ignore EAGAIN errors. all other errors are shown
-                # see also http://www.python.org/dev/peps/pep-3151/#select
-                if e[0] != errno.EAGAIN:
-                    raise SerialException('read failed: {}'.format(e))
-            if timeout.expired():
-                break
+                pass
+        else:
+            timeout = Timeout(self._timeout)
+            while len(read) < size:
+                try:
+                    ready, _, _ = select.select([self.fd, self.pipe_abort_read_r], [], [], timeout.time_left())
+                    if self.pipe_abort_read_r in ready:
+                        os.read(self.pipe_abort_read_r, 1000)
+                        break
+                    # If select was used with a timeout, and the timeout occurs, it
+                    # returns with empty lists -> thus abort read operation.
+                    # For timeout == 0 (non-blocking operation) also abort when
+                    # there is nothing to read.
+                    if not ready:
+                        break   # timeout
+                    buf = os.read(self.fd, size - len(read))
+                    # read should always return some data as select reported it was
+                    # ready to read when we get to this point.
+                    if not buf:
+                        # Disconnected devices, at least on Linux, show the
+                        # behavior that they are always ready to read immediately
+                        # but reading returns nothing.
+                        raise SerialException(
+                            'device reports readiness to read but returned no data '
+                            '(device disconnected or multiple access on port?)')
+                    read.extend(buf)
+                except OSError as e:
+                    # this is for Python 3.x where select.error is a subclass of
+                    # OSError ignore EAGAIN errors. all other errors are shown
+                    if e.errno != errno.EAGAIN and e.errno != errno.EINTR:
+                        raise SerialException('read failed: {}'.format(e))
+                except select.error as e:
+                    # this is for Python 2.x
+                    # ignore EAGAIN errors. all other errors are shown
+                    # see also http://www.python.org/dev/peps/pep-3151/#select
+                    if e[0] != errno.EAGAIN:
+                        raise SerialException('read failed: {}'.format(e))
+                if timeout.expired():
+                    break
+            pass
         return bytes(read)
 
     def cancel_read(self):
